@@ -20,6 +20,73 @@
 
 ---
 
+## 核心机制
+
+### 1. 自动记忆：每轮对话自动写入向量库
+
+Claude Code 本身没有跨会话记忆——关掉终端，一切归零。这套系统通过 **CLAUDE.md 双写规则** 解决这个问题：
+
+```
+你和 Claude Code 的每一轮对话
+  │
+  ├── Claude 回复你之后，自动执行：
+  │   ├── ① store_memory → Qdrant（向量化存储，语义可搜）
+  │   └── ② add_memory  → Graphiti（提取实体和关系）
+  │
+  └── 下一次新会话开始时：
+      └── Claude 根据你的问题，自动 search_memory
+          → 召回历史相关记忆，融入回答
+```
+
+**你不需要手动操作**。只要在 `CLAUDE.md` 中配置了双写规则（见下方"快速开始"第 6 步），Claude 会在每次实质性回复后自动存储对话摘要。新会话开始时，Claude 根据你的问题语义搜索历史记忆，自动召回相关上下文。
+
+这意味着：
+- 上周调试的 Bug，这周问"上次那个 Redis 连接超时怎么解决的"，Claude 直接给你答案
+- 三个月前的架构决策，问"当时为什么选了 PostgreSQL 而不是 MongoDB"，理由自动浮现
+- 所有对话按 category 分类（debug/decision/solution/feedback...），重要记忆加权，闲聊降权
+
+### 2. Obsidian 回流：笔记变成低成本记忆
+
+Claude Code 在工作中会自动往 Obsidian 写入各种文档——会话总结、设计方案、复盘报告、架构图等。这些文档沉淀在 Obsidian vault 里，但 **Claude Code 要读取它们代价很高**：
+
+| 读取方式 | Token 消耗 | 速度 |
+|---|---|---|
+| 通过 Obsidian MCP 读原文 | **数千~数万 Token**（取决于文档长度） | 慢（全文加载） |
+| 通过 Qdrant 向量搜索 | **几百 Token**（只返回相关片段） | 快（毫秒级语义匹配） |
+
+Obsidian 同步脚本（每 5 分钟自动运行）做的事情就是：
+
+```
+Obsidian vault 中的笔记
+  │
+  ├── obsidian-sync-qdrant.py（LaunchAgent 守护进程）
+  │   ├── 通过 Obsidian REST API 读取所有 .md 文件
+  │   ├── content hash 变更检测（只处理新增/修改的文件）
+  │   ├── 长文档自动分块
+  │   ├── text-embedding-v4 向量化
+  │   ├── 写入 Qdrant（语义可搜）
+  │   └── 写入 Graphiti（实体提取）
+  │
+  └── 效果：Claude Code 下次提问时
+      └── search_memory 就能搜到 Obsidian 里的内容
+          → 不需要打开文件、不需要读全文、只返回相关片段
+          → Token 消耗降低 90%+
+```
+
+**关键理解**：Obsidian 在这套系统中不是信息的"源头"——信息的源头是 Claude Code 的对话。Claude Code 把有价值的内容写入 Obsidian 做结构化沉淀，同步脚本再把这些沉淀回流到向量库，形成一个**低成本、高效率的记忆闭环**：
+
+```
+Claude Code 对话 → 写入 Obsidian（结构化沉淀）
+                        ↓
+               同步脚本（每 5 分钟）
+                        ↓
+                  Qdrant 向量库
+                        ↓
+           Claude Code 新会话（低成本召回）
+```
+
+---
+
 ## 架构
 
 ```
