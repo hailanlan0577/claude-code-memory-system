@@ -1,191 +1,523 @@
 # Claude Code Memory System
 
-为 Claude Code 构建的三合一永久记忆系统：**向量语义记忆 + 知识图谱 + 结构化笔记**。
+**给 Claude Code 装上永久记忆。**
+
+三合一记忆系统：Qdrant 向量语义搜索 + Graphiti 知识图谱推理 + Obsidian 笔记自动同步。跨会话记忆持久化，对话不再从零开始。
+
+---
+
+## 有记忆 vs 没记忆
+
+| | 没有记忆系统 | 只有 Qdrant 向量记忆 | Qdrant + Graphiti + Obsidian |
+|---|---|---|---|
+| **跨会话** | 关窗口全忘，每次从零开始 | 每轮对话自动存入向量数据库，永久保留 | 同左 |
+| **搜索能力** | 只有 `MEMORY.md`（手写 200 行笔记） | 语义搜索，搜"包的管理"能找到"包务模块" | 同左 + 精确关键词搜索 |
+| **知识推理** | 无法回答"谁负责这个模块" | **做不到** — 只能按相似度找文本，不理解实体关系 | Graphiti 自动提取实体并建立关系 |
+| **笔记整合** | Obsidian 笔记和 Claude 割裂 | 手动复制粘贴 | 每 5 分钟自动同步 Obsidian → 向量库 |
+| **搜索策略** | `grep` | 语义搜索（一种方式） | 语义 + 关键词 + 图谱融合搜索 |
+
+**一句话总结：Qdrant 让你"找到"，Graphiti 让你"理解"，Obsidian 让你"沉淀"。**
+
+---
 
 ## 架构
 
 ```
 Claude Code
-├── Qdrant V3（向量语义记忆）
-│   ├── Embedding: 阿里云 text-embedding-v4，1024 维
-│   ├── 自动去重（相似度 >0.92 跳过）
-│   ├── 语义搜索 + 关键词搜索 + 融合搜索
-│   └── MCP Server: server_v3.py（stdio 传输）
 │
-├── Graphiti + Neo4j（知识图谱记忆）
-│   ├── 实体关系推理、历史演变追踪
-│   ├── MCP Server: HTTP 传输（端口 18001）
-│   └── 后端: Neo4j 5 + APOC 插件
+├── MCP: qdrant-memory-v3 (stdio)          ← 向量语义记忆
+│   ├── store_memory      存储（自动去重）
+│   ├── search_memory     语义搜索（加权 + 时间衰减 + 去重）
+│   ├── keyword_search    精确关键词搜索
+│   ├── hybrid_search     融合搜索（Qdrant + Graphiti 并行）
+│   ├── delete_memory     精确/模糊删除
+│   ├── update_memory     原地更新
+│   ├── compact_conversations  按天压缩旧对话
+│   └── memory_stats      统计信息
 │
-├── Obsidian（结构化笔记）
-│   ├── iCloud 同步
-│   ├── 定时同步到 Qdrant + Graphiti（每 5 分钟）
-│   └── REST API（端口 27124）
+├── MCP: graphiti (HTTP)                   ← 知识图谱
+│   ├── add_memory         写入（自动提取实体和关系）
+│   ├── search_nodes       搜索实体节点
+│   └── search_memory_facts 搜索关系事实
 │
-└── 双写规则
-    └── 每次实质性回复 → 同时写入 Qdrant + Graphiti
+└── 双写规则：每次回复 → 同时写入 Qdrant + Graphiti
+│
+│   ┌─────────────────────────────────────────────┐
+│   │  hybrid_search 内部：                        │
+│   │  线程 1: Qdrant 向量搜索                      │
+│   │  线程 2: Graphiti Streamable HTTP 图谱搜索     │
+│   │  → 结果合并去重统一返回                        │
+│   └─────────────────────────────────────────────┘
+│
+├── Docker
+│   ├── Qdrant     (localhost:6333)   向量数据库
+│   └── Neo4j 5    (localhost:7687)   图数据库（Graphiti 后端）
+│
+└── Obsidian 自动同步（LaunchAgent, 每 5 分钟）
+    └── obsidian-sync-qdrant.py
+        ├── Obsidian REST API 读取笔记
+        ├── text-embedding-v4 生成向量
+        ├── 写入 Qdrant（增量，content hash 变更检测）
+        └── 写入 Graphiti（实体提取）
 ```
+
+### Qdrant vs Graphiti 各自的角色
+
+| | Qdrant 向量数据库 | Graphiti 知识图谱 |
+|---|---|---|
+| **存什么** | 完整文本的向量编码 | 从文本中提取的实体、关系、事实 |
+| **怎么搜** | 向量余弦相似度（语义搜索） | 图遍历（实体关系查询） |
+| **擅长** | "找类似的内容"（模糊匹配） | "找关联的事物"（精确推理） |
+| **举例** | 搜"退货" → 找到所有退货相关对话 | 搜"张哥" → 发现他是供货方，供了什么货 |
+| **弱点** | 不理解实体关系 | 不擅长语义模糊匹配 |
+| **底层** | Qdrant (port 6333) | Neo4j (port 7687) |
+
+**`hybrid_search` 把两者并行查询、统一返回**，弥补各自弱点。
+
+---
 
 ## 目录结构
 
 ```
-├── mcp-qdrant-memory/        # Qdrant MCP 服务端（核心）
-│   ├── server_v3.py          # 主服务（store/search/hybrid_search 等）
-│   ├── compact_v3.py         # 记忆压缩（按天合并旧对话）
-│   ├── healthcheck.sh        # 15 项健康检查脚本
-│   └── openclaw-plugin-v3/   # OpenClaw 飞书网关插件
+├── mcp-qdrant-memory/             # 核心：Qdrant MCP 服务端
+│   ├── server_v3.py               #   主服务（9 个 MCP 工具）
+│   ├── compact_v3.py              #   记忆压缩工具（按天合并旧对话）
+│   ├── healthcheck.sh             #   15 项一键诊断脚本
+│   ├── requirements.txt           #   Python 依赖
+│   ├── migrate_to_v3.py           #   从 v2 迁移数据
+│   ├── backfill_importance.py     #   补填 importance 字段
+│   ├── capacity_alert.py          #   容量告警
+│   └── openclaw-plugin-v3/        #   OpenClaw 飞书网关插件
 │
-├── graphiti-local/            # Graphiti MCP 本地服务
-│   ├── mcp_server/           # MCP Server 源码
-│   └── patches/              # 针对 graphiti_core 的中文优化补丁
+├── graphiti-local/                # Graphiti MCP 本地服务
+│   ├── mcp_server/                #   MCP Server 源码
+│   │   ├── src/graphiti_mcp_server.py  #   主入口
+│   │   ├── config/                #   配置模板
+│   │   ├── pyproject.toml         #   依赖定义
+│   │   └── tests/                 #   测试
+│   └── patches/                   #   中文优化补丁（去重/提取 prompt）
 │
-├── memory-docker/             # Docker Compose 编排
-│   └── docker-compose.yml    # Qdrant + Neo4j 容器
+├── memory-docker/                 # Docker 编排
+│   ├── docker-compose.yml         #   Qdrant + Neo4j 一键启动
+│   ├── migrate_qdrant.py          #   Qdrant 数据迁移
+│   └── migrate_graphiti.py        #   Graphiti 数据迁移
 │
-├── claude-config/             # Claude Code 配置参考
-│   ├── docs/memory-system.md # 完整架构文档
-│   └── scripts/              # Obsidian → Qdrant/Graphiti 同步脚本
+├── claude-config/                 # Claude Code 配置参考
+│   ├── docs/memory-system.md      #   完整架构文档（已知坑 & 修复历史）
+│   └── scripts/                   #   Obsidian 同步脚本
+│       └── obsidian-sync-qdrant.py  # Obsidian → Qdrant + Graphiti
 │
-├── launchagents/              # macOS LaunchAgent 守护进程模板
-│   ├── com.claude.obsidian-sync-qdrant.plist
-│   ├── com.graphiti.tunnel.plist
-│   └── com.qdrant.ssh-tunnel.plist
+├── launchagents/                  # macOS LaunchAgent 模板
+│   ├── com.claude.obsidian-sync-qdrant.plist  # Obsidian 同步守护
+│   ├── com.graphiti.tunnel.plist              # Graphiti 服务进程
+│   └── com.qdrant.ssh-tunnel.plist            # SSH 隧道（多机场景）
 │
-└── bin/                       # 启动脚本
-    ├── graphiti-tunnel.sh     # Graphiti MCP 进程启动
-    └── qdrant-tunnel.sh       # Qdrant SSH 隧道（多机场景）
+└── bin/                           # 启动脚本
+    ├── graphiti-tunnel.sh         #   Graphiti MCP 进程启动
+    └── qdrant-tunnel.sh           #   Qdrant SSH 隧道
 ```
+
+---
 
 ## 快速开始
 
 ### 前置要求
 
-- macOS（LaunchAgent 为 macOS 专用，Linux 可改用 systemd）
-- Docker Desktop
-- Python 3.11+
-- 阿里云 DashScope API Key（用于 text-embedding-v4）
-- Obsidian + [Local REST API](https://github.com/coddingtonbear/obsidian-local-rest-api) 插件（可选）
+| 依赖 | 用途 | 安装 |
+|------|------|------|
+| Docker Desktop | 运行 Qdrant + Neo4j | [docker.com](https://www.docker.com/products/docker-desktop/) |
+| Python 3.11+ | 运行 MCP Server | `brew install python@3.11` |
+| Claude Code CLI | AI 编程助手 | [claude.ai/code](https://claude.ai/code) |
+| 阿里云 DashScope API Key | text-embedding-v4 向量化 | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com/) |
+| Obsidian + Local REST API 插件 | （可选）笔记同步 | [obsidian.md](https://obsidian.md/) |
 
-### 1. 启动基础服务
+> **关于 Embedding 模型**：本项目默认使用阿里云 text-embedding-v4（1024 维，8192 Token，中文表现优异）。你可以替换为 OpenAI text-embedding-3-small 或其他兼容 REST API 的 embedding 服务，只需修改 `server_v3.py` 中的 `get_embedding()` 函数。
+
+### 第 1 步：启动 Docker 容器
 
 ```bash
-# 克隆仓库
 git clone https://github.com/hailanlan0577/claude-code-memory-system.git
-cd claude-code-memory-system
+cd claude-code-memory-system/memory-docker
 
-# 启动 Qdrant + Neo4j
-cd memory-docker
+# 修改 Neo4j 密码（编辑 docker-compose.yml 中的 NEO4J_AUTH）
 docker compose up -d
 ```
 
-### 2. 配置环境变量
-
-在 `~/.zshenv` 中添加：
+启动后验证：
 
 ```bash
-export DASHSCOPE_API_KEY=your_dashscope_api_key
-export OBSIDIAN_API_KEY=your_obsidian_api_key  # 可选，Obsidian 同步用
+# Qdrant 应返回 {"title":"qdrant - vectorass engine",...}
+curl http://localhost:6333
+
+# Neo4j 浏览器打开 http://localhost:7474
 ```
 
-### 3. 安装 Qdrant MCP Server
+### 第 2 步：配置环境变量
+
+在 `~/.zshenv`（或 `~/.bashrc`）中添加：
+
+```bash
+# 必须：阿里云 Embedding API
+export DASHSCOPE_API_KEY=your_dashscope_api_key
+
+# 可选：Obsidian REST API（仅同步功能需要）
+export OBSIDIAN_API_KEY=your_obsidian_api_key
+```
+
+重新加载：`source ~/.zshenv`
+
+### 第 3 步：安装 Qdrant MCP Server
 
 ```bash
 cd mcp-qdrant-memory
 python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-
-# 注册到 Claude Code
-claude mcp add qdrant-memory-v3 \
-  -e DASHSCOPE_API_KEY \
-  -- python3 /path/to/server_v3.py
 ```
 
-### 4. 安装 Graphiti MCP Server
+注册到 Claude Code：
+
+```bash
+claude mcp add qdrant-memory-v3 \
+  -e DASHSCOPE_API_KEY \
+  -- /path/to/mcp-qdrant-memory/venv/bin/python \
+  /path/to/mcp-qdrant-memory/server_v3.py
+```
+
+### 第 4 步：安装 Graphiti MCP Server
 
 ```bash
 cd graphiti-local/mcp_server
 python3.11 -m venv venv
 source venv/bin/activate
 pip install -e .
+```
 
-# 应用中文优化补丁
-cd ../patches && bash apply-patches.sh
+配置 `.env` 文件：
 
-# 启动服务
-python src/graphiti_mcp_server.py --transport http --port 18001
+```bash
+cp .env.example .env
+# 编辑 .env，填入 Neo4j 密码和 OpenAI/其他 LLM API Key
+# Graphiti 需要 LLM 来提取实体和关系
+```
 
-# 注册到 Claude Code
+应用中文优化补丁（可选，提升中文实体提取质量）：
+
+```bash
+cd ../patches
+bash apply-patches.sh
+```
+
+启动 Graphiti 服务：
+
+```bash
+cd ../mcp_server
+venv/bin/python src/graphiti_mcp_server.py --transport http --port 18001
+```
+
+注册到 Claude Code：
+
+```bash
 claude mcp add graphiti --transport http http://localhost:18001/mcp
 ```
 
-### 5. 配置 Claude Code 双写规则
-
-在你的项目 `CLAUDE.md` 中添加双写规则，让 Claude 每次回复后自动同时写入 Qdrant 和 Graphiti。参考 `claude-config/docs/memory-system.md` 第三节。
-
-### 6.（可选）配置 Obsidian 同步
+### 第 5 步：验证安装
 
 ```bash
-# 复制同步脚本
-cp claude-config/scripts/obsidian-sync-qdrant.py ~/.claude/scripts/hooks/
+# 健康检查（15 项诊断）
+bash mcp-qdrant-memory/healthcheck.sh
+```
 
-# 配置 LaunchAgent（修改路径后）
+重启 Claude Code，在对话中测试：
+
+```
+> 记住：我喜欢用 Python 写后端，前端用 React
+
+# Claude 应自动调用 store_memory 存储这条偏好
+# 后续对话中搜索相关记忆时会自动召回
+```
+
+### 第 6 步：配置双写规则（推荐）
+
+在你的项目 `CLAUDE.md` 中添加以下规则，让 Claude 每次实质性回复后自动同时写入两个系统：
+
+```markdown
+## 自动对话记录
+
+每次回复用户后，同时执行：
+
+### 写入 Qdrant
+调用 `mcp__qdrant-memory-v3__store_memory`：
+- content: "[问] 问题摘要\n[答] 回答摘要\n[上下文] 项目/技术栈"
+- category: conversation（或 debug/decision/solution/feedback）
+- tags: "日期,项目名,技术关键词"
+
+### 写入 Graphiti
+调用 `mcp__graphiti__add_memory`：
+- name: "[YYYY-MM-DD] 主题摘要"
+- episode_body: 与 Qdrant content 相同
+- group_id: "claude_code"
+```
+
+完整的双写规则模板和分类自检流程请参考 `claude-config/docs/memory-system.md` 第三节。
+
+### 第 7 步：Obsidian 自动同步（可选）
+
+如果你使用 Obsidian 做笔记，可以配置自动同步，将笔记内容持续同步到 Qdrant + Graphiti：
+
+1. 安装 Obsidian 插件 [Local REST API](https://github.com/coddingtonbear/obsidian-local-rest-api)，生成 API Key
+2. 复制同步脚本：
+
+```bash
+mkdir -p ~/.claude/scripts/hooks
+cp claude-config/scripts/obsidian-sync-qdrant.py ~/.claude/scripts/hooks/
+```
+
+3. 配置 LaunchAgent 守护进程（macOS）：
+
+```bash
+# 编辑 plist，修改脚本路径和 API Key
 cp launchagents/com.claude.obsidian-sync-qdrant.plist ~/Library/LaunchAgents/
-# 编辑 plist 修改路径和 API Key
+# 修改后加载
 launchctl load ~/Library/LaunchAgents/com.claude.obsidian-sync-qdrant.plist
 ```
 
-## 核心功能
+同步脚本每 5 分钟通过 Obsidian REST API 读取笔记，增量同步（基于 content hash 变更检测），自动分块长文档。
 
-### Qdrant MCP 工具
+---
 
-| 工具 | 功能 |
-|------|------|
-| `store_memory` | 存储记忆，自动去重 |
-| `search_memory` | 语义搜索（向量 + 重要性加权 + 时间衰减） |
-| `keyword_search` | 精确关键词搜索 |
-| `hybrid_search` | 融合搜索（并行查询 Qdrant + Graphiti） |
-| `delete_memory` | 精确/语义模糊删除 |
-| `update_memory` | 原地更新记忆 |
-| `compact_conversations` | 压缩旧对话，按天合并为摘要 |
+## 搜索工具详解
 
-### Graphiti 知识图谱
+### 9 个 MCP 工具一览
 
-- `add_memory` — 写入知识图谱（自动提取实体和关系）
-- `search_nodes` — 搜索实体节点
-- `search_memory_facts` — 搜索关系事实
+| 工具 | 用途 | 特点 |
+|------|------|------|
+| `store_memory` | 存储记忆 | 自动去重（相似度 >0.92 跳过），自动 importance 分级 |
+| `search_memory` | 语义搜索 | 向量相似度 + importance 加权 + 时间衰减 + 结果去重 |
+| `keyword_search` | 关键词搜索 | 精确匹配 content 和 tags，支持日期搜索 |
+| `hybrid_search` | 融合搜索 | **并行查询 Qdrant 向量 + Graphiti 图谱，统一返回** |
+| `delete_memory` | 删除记忆 | 支持精确内容删除和语义模糊删除 |
+| `update_memory` | 更新记忆 | 原地更新，保留原始 ID 和创建时间 |
+| `list_memories` | 浏览记忆 | 按分类列出所有记忆 |
+| `compact_conversations` | 压缩对话 | 按天合并旧 conversation 记忆为摘要 |
+| `memory_stats` | 统计信息 | 各分类计数，60 秒 TTL 缓存 |
 
-### 搜索策略
+### 搜索策略指南
 
-| 场景 | 推荐工具 |
-|------|----------|
-| 模糊/语义搜索 | `search_memory` |
-| 精确关键词 | `keyword_search` |
-| 实体关系/跨项目关联 | `hybrid_search` |
-| 找不到时 | 两个都试试 |
+| 你想做什么 | 用哪个工具 | 为什么 |
+|---|---|---|
+| 模糊搜索（"退货相关的问题"） | `search_memory` | 向量语义理解，不需要精确词匹配 |
+| 精确搜索（"PR200156"、"2026-03-19"） | `keyword_search` | 文本精确匹配，不会遗漏 |
+| 实体关系（"张哥和我们什么关系"） | `hybrid_search` | Graphiti 图谱推理实体关系 |
+| 跨项目关联（"哪些项目用了 Redis"） | `hybrid_search` | Graphiti 关系遍历 |
+| 什么都搜不到 | 两个都试 | 向量和关键词互补 |
+
+### importance 权重机制
+
+记忆按 category 自动分级，搜索时加权排序：
+
+| importance | 权重 | 对应的 category |
+|---|---|---|
+| **high** (★) | 1.3x | project, architecture, solution, preference, debug, feedback, decision, summary |
+| **medium** (☆) | 1.0x | fact, general, conversation |
+| **low** (·) | 0.7x | other |
+
+搜索结果还会叠加**时间衰减**：近 7 天 1.2x 加权，7-30 天 1.0x，1-3 月 0.9x，3-12 月 0.8x，1 年以上 0.7x。
+
+### hybrid_search 内部工作原理
+
+```
+调用 hybrid_search(query="张哥的供货记录")
+│
+├── 线程 1: Qdrant 向量搜索
+│   └── text-embedding-v4 → cosine similarity → top N
+│
+└── 线程 2: Graphiti 图谱搜索（Streamable HTTP）
+    ├── POST /mcp → initialize（获取 Mcp-Session-Id）
+    ├── POST /mcp → tools/call: search_nodes
+    └── POST /mcp → tools/call: search_memory_facts
+│
+└── 合并结果 → 去重 → 加权排序 → 返回
+```
+
+---
+
+## 记忆分类体系
+
+| category | 什么时候用 | 示例 |
+|---|---|---|
+| `conversation` | 日常对话记录（自动双写） | "[问] 如何配置 Redis [答] 推荐使用 docker..." |
+| `project` | 项目关键信息 | "luxury-bag-inventory 使用 Flutter + Supabase" |
+| `architecture` | 架构决策 | "记忆系统从双机共享改为双机独立" |
+| `decision` | 技术选型 | "选择 text-embedding-v4 而非 OpenAI embedding" |
+| `solution` | 问题解决方案 | "Neo4j dump 要先停库，改用 APOC stream 导出" |
+| `debug` | Bug 调试经验 | "Graphiti 404 根因：用了废弃的 SSE transport" |
+| `feedback` | 用户纠正行为 | "不要在测试中 mock 数据库" |
+| `preference` | 用户偏好 | "用户偏好 Python 后端 + React 前端" |
+| `summary` | 压缩后的摘要 | compact_conversations 生成 |
+| `general` | 通用信息 | 不属于以上任何分类 |
+
+---
+
+## 进阶配置
+
+### 替换 Embedding 模型
+
+修改 `server_v3.py` 中的 `get_embedding()` 函数。例如切换为 OpenAI：
+
+```python
+EMBEDDING_API_URL = "https://api.openai.com/v1/embeddings"
+EMBEDDING_MODEL = "text-embedding-3-small"
+VECTOR_DIM = 1536  # 或 1024/512
+
+def get_embedding(text: str, text_type: str = "document") -> list[float]:
+    resp = _http_client.post(
+        EMBEDDING_API_URL,
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", ...},
+        json={"model": EMBEDDING_MODEL, "input": text, "dimensions": VECTOR_DIM},
+    )
+    return resp.json()["data"][0]["embedding"]
+```
+
+> **注意**：更换 embedding 模型后需要重建 Qdrant collection 并重新导入数据（维度变化）。
+
+### 多机部署
+
+`bin/qdrant-tunnel.sh` 提供了通过 SSH 隧道跨机器访问 Qdrant 的方案：
+
+```bash
+# MacBook Pro → Mac Mini 的 Qdrant
+ssh -fNL 26333:localhost:6333 macmini
+
+# server_v3.py 中 search_openclaw_memory 即通过此隧道访问远端记忆
+```
+
+适合在多台机器间共享记忆、或将数据库部署在服务器上的场景。
+
+### 守护进程（macOS LaunchAgent）
+
+`launchagents/` 目录提供了三个守护进程模板：
+
+| 文件 | 功能 | 频率 |
+|------|------|------|
+| `com.graphiti.tunnel.plist` | Graphiti MCP 进程保活 | KeepAlive |
+| `com.qdrant.ssh-tunnel.plist` | SSH 隧道保活 | KeepAlive |
+| `com.claude.obsidian-sync-qdrant.plist` | Obsidian 同步 | 每 5 分钟 |
+
+修改路径和 API Key 后：
+
+```bash
+cp launchagents/*.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.graphiti.tunnel.plist
+```
+
+Linux 用户可参考 plist 配置改写为 systemd service。
+
+---
 
 ## 健康检查
 
 ```bash
-bash mcp-qdrant-memory/healthcheck.sh
+bash mcp-qdrant-memory/healthcheck.sh        # 诊断
+bash mcp-qdrant-memory/healthcheck.sh --fix   # 自动修复
 ```
 
-检查 15 项：Docker 容器、Qdrant 连通、Collection 状态、Neo4j 连通、Graphiti MCP、Embedding API 等。
+检查 15 项：
 
-## 自定义
+1. Qdrant 容器连通性
+2. Neo4j / Graphiti 连通性
+3. Graphiti MCP Server（HTTP transport）
+4. Claude Code MCP 注册状态
+5. `server_v3.py` 代码完整性（Streamable HTTP vs 废弃 SSE）
+6. Qdrant 数据可读性
+7. Graphiti `search_nodes` 端到端测试
+8. 记忆总量和 conversation 占比（>60% 建议 compact）
+9. DashScope Embedding API 可用性
+10. 备份新鲜度
+11. 技术文档完整性
 
-### 替换 Embedding 模型
+---
 
-在 `server_v3.py` 中修改 `get_embedding()` 函数。当前使用阿里云 text-embedding-v4（1024 维），你可以替换为：
-- OpenAI text-embedding-3-small/large
-- 其他兼容 REST API 的 embedding 服务
+## 已知坑 & 避坑指南
 
-注意：更换 embedding 模型后需要重建 Qdrant collection 并重新导入数据。
+这些是我们踩过的坑，帮你避免重复犯错：
 
-### 多机部署
+| 坑 | 根因 | 正确做法 |
+|---|---|---|
+| Graphiti MCP 工具不出现 | Claude Code 只读 `~/.claude.json`，不读 `~/.claude/mcp.json` | 用 `claude mcp add` 命令注册 |
+| Graphiti 返回 404 | 使用了废弃的 `--transport sse` | 必须用 `--transport http` |
+| `hybrid_search` 中 Graphiti 始终超时 | 代码用 SSE 协议（`GET /sse`）连 HTTP 服务 | 使用 Streamable HTTP（`POST /mcp` + `Mcp-Session-Id`） |
+| Neo4j dump 要先停库 | `neo4j-admin database dump` 不支持在线导出 | 用 `CALL apoc.export.json.all(null, {stream:true})` |
+| 中文语义搜索差 | 小模型（all-MiniLM-L6-v2）中文理解弱 | 换大模型级 embedding（text-embedding-v4） |
+| MCP 配置中密钥明文 | `~/.claude.json` 的 `env` 字段直接写密钥 | 密钥放 `~/.zshenv`，MCP 子进程通过环境变量继承 |
 
-`bin/qdrant-tunnel.sh` 提供了通过 SSH 隧道跨机器访问 Qdrant 的方案，适合在多台机器间共享记忆。
+完整的故障处理历史和修复方案见 `claude-config/docs/memory-system.md` 第五节。
 
-## 许可
+---
+
+## 备份与恢复
+
+### 备份
+
+```bash
+# Qdrant 快照
+curl -X POST "http://localhost:6333/collections/unified_memories_v3/snapshots"
+# 下载快照
+curl -o qdrant-backup.snapshot \
+  "http://localhost:6333/collections/unified_memories_v3/snapshots/<snapshot_name>"
+
+# Neo4j 导出（在线）
+docker exec neo4j-memory cypher-shell -u neo4j -p YOUR_PASSWORD \
+  "CALL apoc.export.json.all(null, {stream:true, useTypes:true}) YIELD data RETURN data" \
+  > neo4j-backup.json
+```
+
+### 恢复
+
+```bash
+# Qdrant 恢复
+curl -X POST "http://localhost:6333/collections/unified_memories_v3/snapshots/upload" \
+  -H "Content-Type: multipart/form-data" \
+  -F "snapshot=@qdrant-backup.snapshot"
+
+# Neo4j 恢复（需要 APOC 插件）
+cat neo4j-backup.json | docker exec -i neo4j-memory \
+  cypher-shell -u neo4j -p YOUR_PASSWORD \
+  "CALL apoc.import.json(null, {stream:true})"
+```
+
+---
+
+## 谁适合用这套系统
+
+这套系统不限于编程场景。任何需要"跨会话记忆 + 实体关系 + 知识沉淀"的角色都能受益：
+
+| 角色 | Qdrant 帮你做什么 | Graphiti 额外做什么 |
+|---|---|---|
+| **开发者** | 搜索历史调试经验、架构决策 | 模块依赖关系图谱 |
+| **产品经理** | 搜索用户反馈、需求讨论 | 需求-功能-用户关联分析 |
+| **销售 / 客户经理** | 搜索客户沟通记录 | 客户画像 + 关系网络 |
+| **研究员 / 分析师** | 语义搜索文献笔记 | 人物-机构-事件关联发现 |
+| **自由职业者** | 跨客户上下文切换 | 跨客户模式发现 |
+| **团队 Leader** | 搜索团队讨论和决策 | 人→项目→资源组织图谱 |
+
+---
+
+## 技术栈
+
+| 组件 | 技术 | 版本 |
+|---|---|---|
+| 向量数据库 | [Qdrant](https://qdrant.tech/) | latest |
+| 图数据库 | [Neo4j](https://neo4j.com/) | 5.x |
+| 知识图谱 | [Graphiti](https://github.com/getzep/graphiti) | latest |
+| MCP 框架 | [FastMCP](https://github.com/jlowin/fastmcp) | via `mcp` package |
+| Embedding | [阿里云 text-embedding-v4](https://help.aliyun.com/zh/model-studio/text-embedding) | 1024 维 |
+| 笔记系统 | [Obsidian](https://obsidian.md/) + Local REST API | 可选 |
+| 容器编排 | Docker Compose | - |
+| 进程管理 | macOS launchd | - |
+
+---
+
+## License
 
 MIT
