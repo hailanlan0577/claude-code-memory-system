@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.env
+.env.*
+*.env.bak
+
+# OMC state
+.omc/
+
+# Data (not included in public repo)
+qdrant-snapshot/
+neo4j-dump/

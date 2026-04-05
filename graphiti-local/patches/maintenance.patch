@@ -1,0 +1,60 @@
+diff -ru --ex /tmp/graphiti-original/graphiti_core/utils/maintenance/edge_operations.py /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/utils/maintenance/edge_operations.py
+--- /tmp/graphiti-original/graphiti_core/utils/maintenance/edge_operations.py	2026-04-01 19:56:18
++++ /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/utils/maintenance/edge_operations.py	2026-04-01 19:08:54
+@@ -143,7 +143,7 @@
+         group_id=group_id,
+         prompt_name='extract_edges.edge',
+     )
+-    all_edges_data = ExtractedEdges(**llm_response).edges
++    all_edges_data = ExtractedEdges.model_validate(llm_response).edges
+ 
+     # Validate entity names
+     edges_data: list[ExtractedEdge] = []
+@@ -559,7 +559,7 @@
+         model_size=ModelSize.small,
+         prompt_name='dedupe_edges.resolve_edge',
+     )
+-    response_object = EdgeDuplicate(**llm_response)
++    response_object = EdgeDuplicate.model_validate(llm_response)
+     duplicate_facts = response_object.duplicate_facts
+ 
+     # Validate duplicate_facts are in valid range for EXISTING FACTS
+diff -ru --ex /tmp/graphiti-original/graphiti_core/utils/maintenance/node_operations.py /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/utils/maintenance/node_operations.py
+--- /tmp/graphiti-original/graphiti_core/utils/maintenance/node_operations.py	2026-04-01 19:56:18
++++ /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/utils/maintenance/node_operations.py	2026-04-01 19:08:56
+@@ -138,7 +138,7 @@
+ ) -> list[ExtractedEntity]:
+     """Extract entities using a single LLM call."""
+     llm_response = await _call_extraction_llm(llm_client, episode, context)
+-    response_object = ExtractedEntities(**llm_response)
++    response_object = ExtractedEntities.model_validate(llm_response)
+     return response_object.extracted_entities
+ 
+ 
+@@ -327,7 +327,7 @@
+         prompt_name='dedupe_nodes.nodes',
+     )
+ 
+-    node_resolutions: list[NodeDuplicate] = NodeResolutions(**llm_response).entity_resolutions
++    node_resolutions: list[NodeDuplicate] = NodeResolutions.model_validate(llm_response).entity_resolutions
+ 
+     valid_relative_range = range(len(state.unresolved_indices))
+     processed_relative_ids: set[int] = set()
+@@ -545,7 +545,7 @@
+     )
+ 
+     # validate response
+-    entity_type(**llm_response)
++    entity_type.model_validate(llm_response)
+ 
+     return llm_response
+ 
+@@ -656,7 +656,7 @@
+         name_to_nodes[key].append(node)
+ 
+     # Apply summaries from LLM response
+-    summaries_response = SummarizedEntities(**llm_response)
++    summaries_response = SummarizedEntities.model_validate(llm_response)
+     for summarized_entity in summaries_response.summaries:
+         matching_nodes = name_to_nodes.get(summarized_entity.name.lower(), [])
+         if matching_nodes:

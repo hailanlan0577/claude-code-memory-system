@@ -1,0 +1,168 @@
+diff -ru --ex /tmp/graphiti-original/graphiti_core/prompts/dedupe_edges.py /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/dedupe_edges.py
+--- /tmp/graphiti-original/graphiti_core/prompts/dedupe_edges.py	2026-04-01 19:56:18
++++ /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/dedupe_edges.py	2026-04-01 19:03:02
+@@ -16,8 +16,10 @@
+ 
+ from typing import Any, Protocol, TypedDict
+ 
+-from pydantic import BaseModel, Field
++from typing import Any
+ 
++from pydantic import BaseModel, Field, model_validator
++
+ from .models import Message, PromptFunction, PromptVersion
+ 
+ 
+@@ -30,6 +32,23 @@
+         ...,
+         description='List of idx values of contradicted facts (from full idx range). Empty list if none.',
+     )
++
++    @model_validator(mode='before')
++    @classmethod
++    def normalize_edge_duplicate_field(cls, data: Any) -> Any:
++        """qwen-plus sometimes returns variant field names."""
++        if isinstance(data, dict):
++            if 'duplicate_facts' not in data:
++                for key in ['duplicates', 'duplicate_idx', 'duplicate_indices']:
++                    if key in data:
++                        data['duplicate_facts'] = data.pop(key)
++                        break
++            if 'contradicted_facts' not in data:
++                for key in ['contradictions', 'contradicted_idx', 'contradicted_indices']:
++                    if key in data:
++                        data['contradicted_facts'] = data.pop(key)
++                        break
++        return data
+ 
+ 
+ class Prompt(Protocol):
+diff -ru --ex /tmp/graphiti-original/graphiti_core/prompts/dedupe_nodes.py /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/dedupe_nodes.py
+--- /tmp/graphiti-original/graphiti_core/prompts/dedupe_nodes.py	2026-04-01 19:56:18
++++ /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/dedupe_nodes.py	2026-04-01 19:23:45
+@@ -16,7 +16,7 @@
+ 
+ from typing import Any, Protocol, TypedDict
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, model_validator
+ 
+ from .models import Message, PromptFunction, PromptVersion
+ from .prompt_helpers import to_prompt_json
+@@ -36,6 +36,22 @@
+ 
+ class NodeResolutions(BaseModel):
+     entity_resolutions: list[NodeDuplicate] = Field(..., description='List of resolved nodes')
++
++    @model_validator(mode='before')
++    @classmethod
++    def normalize_resolutions_field(cls, data: Any) -> Any:
++        """qwen-plus sometimes returns a raw list, variant field names, or a single bare object."""
++        if isinstance(data, list):
++            return {'entity_resolutions': data}
++        if isinstance(data, dict) and 'entity_resolutions' not in data:
++            for key in ['resolutions', 'nodes', 'entities', 'node_resolutions']:
++                if key in data:
++                    data['entity_resolutions'] = data.pop(key)
++                    return data
++            # Single bare NodeDuplicate object (has 'id' + 'name' keys but no list field)
++            if 'id' in data and 'name' in data:
++                return {'entity_resolutions': [data]}
++        return data
+ 
+ 
+ class Prompt(Protocol):
+diff -ru --ex /tmp/graphiti-original/graphiti_core/prompts/extract_edges.py /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/extract_edges.py
+--- /tmp/graphiti-original/graphiti_core/prompts/extract_edges.py	2026-04-01 19:56:18
++++ /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/extract_edges.py	2026-04-01 19:02:56
+@@ -16,7 +16,7 @@
+ 
+ from typing import Any, Protocol, TypedDict
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, model_validator
+ 
+ from .models import Message, PromptFunction, PromptVersion
+ from .prompt_helpers import to_prompt_json
+@@ -49,6 +49,19 @@
+ 
+ class ExtractedEdges(BaseModel):
+     edges: list[Edge]
++
++    @model_validator(mode='before')
++    @classmethod
++    def normalize_edges_field(cls, data: Any) -> Any:
++        """qwen-plus sometimes returns a raw list or variant field names."""
++        if isinstance(data, list):
++            return {'edges': data}
++        if isinstance(data, dict) and 'edges' not in data:
++            for key in ['extracted_edges', 'facts', 'relations', 'relationships']:
++                if key in data:
++                    data['edges'] = data.pop(key)
++                    break
++        return data
+ 
+ 
+ class Prompt(Protocol):
+diff -ru --ex /tmp/graphiti-original/graphiti_core/prompts/extract_nodes.py /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/extract_nodes.py
+--- /tmp/graphiti-original/graphiti_core/prompts/extract_nodes.py	2026-04-01 19:56:18
++++ /Users/YOUR_USERNAME/graphiti-local/mcp_server/venv/lib/python3.11/site-packages/graphiti_core/prompts/extract_nodes.py	2026-04-01 19:21:34
+@@ -16,7 +16,7 @@
+ 
+ from typing import Any, Protocol, TypedDict
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, model_validator
+ 
+ from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
+ 
+@@ -32,11 +32,29 @@
+         'Must be one of the provided entity_type_id integers.',
+     )
+ 
++    @model_validator(mode='before')
++    @classmethod
++    def normalize_entity_field(cls, data: Any) -> Any:
++        """qwen-plus sometimes returns 'entity' instead of 'name'."""
++        if isinstance(data, dict) and 'entity' in data and 'name' not in data:
++            data['name'] = data.pop('entity')
++        return data
+ 
++
+ class ExtractedEntities(BaseModel):
+     extracted_entities: list[ExtractedEntity] = Field(..., description='List of extracted entities')
+ 
++    @model_validator(mode='before')
++    @classmethod
++    def normalize_entities_field(cls, data: Any) -> Any:
++        """qwen-plus sometimes returns a raw list or variant field names."""
++        if isinstance(data, list):
++            return {'extracted_entities': data}
++        if isinstance(data, dict) and 'entities' in data and 'extracted_entities' not in data:
++            data['extracted_entities'] = data.pop('entities')
++        return data
+ 
++
+ class EntitySummary(BaseModel):
+     summary: str = Field(..., description='Summary of the entity')
+ 
+@@ -51,6 +69,19 @@
+         ...,
+         description='List of entity summaries. Only include entities that need summary updates.',
+     )
++
++    @model_validator(mode='before')
++    @classmethod
++    def normalize_summaries_field(cls, data: Any) -> Any:
++        """qwen-plus sometimes returns a raw list or variant field names."""
++        if isinstance(data, list):
++            return {'summaries': data}
++        if isinstance(data, dict) and 'summaries' not in data:
++            for key in ['entity_summaries', 'results', 'entities']:
++                if key in data:
++                    data['summaries'] = data.pop(key)
++                    break
++        return data
+ 
+ 
+ class Prompt(Protocol):
