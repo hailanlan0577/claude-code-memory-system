@@ -1,5 +1,7 @@
 # Claude Code Memory System
 
+**中文** | [English](./README_EN.md)
+
 **给 Claude Code 装上永久记忆。**
 
 三合一记忆系统：Qdrant 向量语义搜索 + Graphiti 知识图谱推理 + Obsidian 笔记自动同步。跨会话记忆持久化，对话不再从零开始。
