@@ -6,6 +6,147 @@
 
 ---
 
+## 实际工作中的作用
+
+没有记忆系统时，你和 Claude Code 的每次对话都是一张白纸。装上记忆系统后，Claude 变成了一个"记得所有事"的长期搭档。以下是真实工作中的典型场景：
+
+### 场景 1：跨会话调试——"上次那个 Bug 怎么修的？"
+
+**没有记忆**：
+
+> 你：Qdrant 连接超时了，报 408 错误
+>
+> Claude：请检查网络连接、端口是否开放、防火墙设置...（给你一堆通用建议）
+
+**有记忆**：
+
+> 你：Qdrant 连接超时了，报 408 错误
+>
+> Claude：（自动搜索到 3 月 31 日的 debug 记忆）上次你遇到过同样的问题，根因是 httpx 默认走了系统代理连本地 Qdrant。修复方法是在代码开头加 `os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")`。要我直接帮你加上吗？
+
+**差别**：从"猜"变成"记得"。debug 类记忆被标记为 high importance，搜索时加权 1.3x，确保能被优先召回。
+
+### 场景 2：架构决策追溯——"当时为什么这么选？"
+
+开发到一半，你或者团队成员质疑某个技术选型：
+
+> 你：我们的 embedding 为什么用阿里云的，不用 OpenAI 的？
+
+**没有记忆**：Claude 只能从技术角度泛泛分析两者优劣。
+
+**有记忆**：
+
+> Claude：（搜到 3 月 26 日的 decision 记忆）你在 3 月 26 日做了这个决策。原因是：
+> 1. all-MiniLM-L6-v2 中文语义理解差，跨词汇搜索失败
+> 2. OpenAI embedding 需要翻墙，延迟不稳定
+> 3. text-embedding-v4 支持 8192 Token（原来只有 512），中文表现大幅提升
+>
+> 当时还对比了 BGE-M3，最终因为阿里云 API 更稳定而选了 text-embedding-v4。
+
+**差别**：不只是"用了什么"，还记得"为什么"和"否决了什么"。三个月后回头看，不用翻聊天记录。
+
+### 场景 3：项目上下文无缝切换——"这个项目之前做到哪了？"
+
+你同时维护多个项目，切换项目时最痛苦的是重建上下文：
+
+> 你：继续做那个中国象棋项目
+
+**没有记忆**：Claude 只知道目录里有什么文件，不知道你的进度、踩过的坑、下一步计划。
+
+**有记忆**：
+
+> Claude：（搜到 project 和 solution 类记忆）上次你完成了棋子移动逻辑和将军判定，但"马腿"规则还有 Bug——马在被蹩腿时仍然可以跳。你当时的思路是在 `canMove()` 里加一个 `isBlocked()` 检查。另外吃子动画还没做，你说过想用 Framer Motion。要从哪个继续？
+
+**差别**：不是从零开始读代码，而是直接接上你上次的思路。
+
+### 场景 4：重复问题自动过滤——"这个我之前问过吗？"
+
+开发过程中经常会反复踩同一个坑：
+
+> 你：Claude Code MCP 工具没加载出来，graphiti 的工具列表是空的
+
+**没有记忆**：Claude 让你检查配置文件、重启服务...你试了一圈发现都不对。
+
+**有记忆**：
+
+> Claude：（搜到 3 月 26 日的 debug 记忆，这个坑踩过 3 次）这个问题你之前遇到过。根因是 **Claude Code 只读 `~/.claude.json`，不读 `~/.claude/mcp.json`**。你需要用 `claude mcp add graphiti --transport http http://localhost:18001/mcp` 注册到正确的配置文件。上次修好后还发现 transport 必须是 http 不能是 sse，也要注意。
+
+**差别**：同一个坑不踩第二次。debug 记忆记录了现象、根因、修复方法，直接给出完整解决方案。
+
+### 场景 5：知识图谱关联发现——"这些事情之间有什么关系？"
+
+Qdrant 向量搜索能找到"相似的内容"，但 Graphiti 能发现"隐藏的关联"：
+
+> 你：最近哪些模块改动过？它们之间有关联吗？
+
+**只有 Qdrant**：列出最近的修改记录，但看不出模块间的依赖关系。
+
+**有 Graphiti**：
+
+> Claude：（hybrid_search 同时查询 Qdrant + Graphiti）最近改动了 3 个模块：
+> - `server_v3.py` 的 `hybrid_search` 函数
+> - `session-to-obsidian.py` 的 Qdrant 写入逻辑
+> - LaunchAgent 的环境变量配置
+>
+> Graphiti 图谱显示它们有关联：`hybrid_search` 内部依赖 Graphiti MCP（HTTP 协议），而 LaunchAgent 负责启动 Graphiti 进程。上次 LaunchAgent 改了 Python 路径导致 Graphiti 没启动，hybrid_search 就全部超时了。这三个改动很可能是同一条链路上的问题。
+
+**差别**：从"列清单"变成"讲故事"，理解模块间的因果关系。
+
+### 场景 6：Obsidian 低成本召回——"那份设计文档里怎么写的？"
+
+Claude 之前帮你写了一份 5000 字的设计文档，存在 Obsidian 里：
+
+> 你：之前那个 AI 买手评分系统的设计方案，评分维度有哪些？
+
+**没有向量化**：通过 Obsidian MCP 读取原文，消耗 8000+ Token，还要等几秒加载。
+
+**有向量化（Obsidian 同步到 Qdrant）**：
+
+> Claude：（search_memory 命中 Obsidian 同步的向量，消耗 ~300 Token）评分维度包括：
+> 1. 品相评估分（成色、划痕、氧化程度）
+> 2. 价格合理性分（对比历史成交价）
+> 3. 市场热度分（品牌 × 款式 × 颜色的流通速度）
+> 4. 利润空间分（预估售价 - 进价 - 养护成本）
+
+**差别**：同样的信息，Token 消耗从 8000 降到 300，快了 10 倍以上。一天问 20 次，省下来的 Token 很可观。
+
+### 场景 7：长期趋势分析——"这几个月的规律是什么？"
+
+记忆积累到一定量后，可以做回顾性分析：
+
+> 你：总结一下我最近三个月用 Claude Code 主要做了什么
+
+> Claude：（search_memory + keyword_search 按日期范围搜索）
+> - **1 月**：主要在做中国象棋 React 项目，完成了棋盘渲染和基本走子规则
+> - **2 月**：转向二手奢侈品库存管理 App，用 Flutter + Supabase，完成了商品录入和拍照功能
+> - **3 月**：大量时间花在记忆系统搭建上——从 Pinecone 迁移到 Qdrant，集成 Graphiti，embedding 从小模型升级到 text-embedding-v4，解决了十几个连通性 Bug
+> - **贯穿三个月**：Obsidian 笔记体系逐步建立，会话自动归档流程从手动变成全自动
+>
+> 技术偏好变化：从 JavaScript 转向 Python 后端 + Flutter 前端的组合。
+
+**差别**：你自己可能都忘了三个月前在做什么，但记忆系统帮你保留了完整的工作轨迹。
+
+### 场景 8：新项目冷启动——"帮我搭建一个新项目"
+
+> 你：帮我搭建一个 Next.js 项目
+
+**没有记忆**：Claude 给你一个标准模板。
+
+**有记忆**：
+
+> Claude：（搜到 preference 类记忆）根据你之前的偏好：
+> - 你习惯用 TypeScript strict 模式
+> - 状态管理偏好 Zustand 而不是 Redux
+> - 样式方案之前选了 Tailwind CSS
+> - 你讨厌默认的 ESLint 配置太松，上次手动加了 `@typescript-eslint/strict`
+> - 测试框架用 Vitest
+>
+> 我直接按这些偏好初始化，行吗？
+
+**差别**：Claude 变成了了解你编程习惯的搭档，不需要每次重复说"我要 TypeScript"、"我用 Tailwind"。
+
+---
+
 ## 有记忆 vs 没记忆
 
 | | 没有记忆系统 | 只有 Qdrant 向量记忆 | Qdrant + Graphiti + Obsidian |
@@ -565,147 +706,6 @@ cat neo4j-backup.json | docker exec -i neo4j-memory \
   cypher-shell -u neo4j -p YOUR_PASSWORD \
   "CALL apoc.import.json(null, {stream:true})"
 ```
-
----
-
-## 实际工作中的作用
-
-没有记忆系统时，你和 Claude Code 的每次对话都是一张白纸。装上记忆系统后，Claude 变成了一个"记得所有事"的长期搭档。以下是真实工作中的典型场景：
-
-### 场景 1：跨会话调试——"上次那个 Bug 怎么修的？"
-
-**没有记忆**：
-
-> 你：Qdrant 连接超时了，报 408 错误
->
-> Claude：请检查网络连接、端口是否开放、防火墙设置...（给你一堆通用建议）
-
-**有记忆**：
-
-> 你：Qdrant 连接超时了，报 408 错误
->
-> Claude：（自动搜索到 3 月 31 日的 debug 记忆）上次你遇到过同样的问题，根因是 httpx 默认走了系统代理连本地 Qdrant。修复方法是在代码开头加 `os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")`。要我直接帮你加上吗？
-
-**差别**：从"猜"变成"记得"。debug 类记忆被标记为 high importance，搜索时加权 1.3x，确保能被优先召回。
-
-### 场景 2：架构决策追溯——"当时为什么这么选？"
-
-开发到一半，你或者团队成员质疑某个技术选型：
-
-> 你：我们的 embedding 为什么用阿里云的，不用 OpenAI 的？
-
-**没有记忆**：Claude 只能从技术角度泛泛分析两者优劣。
-
-**有记忆**：
-
-> Claude：（搜到 3 月 26 日的 decision 记忆）你在 3 月 26 日做了这个决策。原因是：
-> 1. all-MiniLM-L6-v2 中文语义理解差，跨词汇搜索失败
-> 2. OpenAI embedding 需要翻墙，延迟不稳定
-> 3. text-embedding-v4 支持 8192 Token（原来只有 512），中文表现大幅提升
->
-> 当时还对比了 BGE-M3，最终因为阿里云 API 更稳定而选了 text-embedding-v4。
-
-**差别**：不只是"用了什么"，还记得"为什么"和"否决了什么"。三个月后回头看，不用翻聊天记录。
-
-### 场景 3：项目上下文无缝切换——"这个项目之前做到哪了？"
-
-你同时维护多个项目，切换项目时最痛苦的是重建上下文：
-
-> 你：继续做那个中国象棋项目
-
-**没有记忆**：Claude 只知道目录里有什么文件，不知道你的进度、踩过的坑、下一步计划。
-
-**有记忆**：
-
-> Claude：（搜到 project 和 solution 类记忆）上次你完成了棋子移动逻辑和将军判定，但"马腿"规则还有 Bug——马在被蹩腿时仍然可以跳。你当时的思路是在 `canMove()` 里加一个 `isBlocked()` 检查。另外吃子动画还没做，你说过想用 Framer Motion。要从哪个继续？
-
-**差别**：不是从零开始读代码，而是直接接上你上次的思路。
-
-### 场景 4：重复问题自动过滤——"这个我之前问过吗？"
-
-开发过程中经常会反复踩同一个坑：
-
-> 你：Claude Code MCP 工具没加载出来，graphiti 的工具列表是空的
-
-**没有记忆**：Claude 让你检查配置文件、重启服务...你试了一圈发现都不对。
-
-**有记忆**：
-
-> Claude：（搜到 3 月 26 日的 debug 记忆，这个坑踩过 3 次）这个问题你之前遇到过。根因是 **Claude Code 只读 `~/.claude.json`，不读 `~/.claude/mcp.json`**。你需要用 `claude mcp add graphiti --transport http http://localhost:18001/mcp` 注册到正确的配置文件。上次修好后还发现 transport 必须是 http 不能是 sse，也要注意。
-
-**差别**：同一个坑不踩第二次。debug 记忆记录了现象、根因、修复方法，直接给出完整解决方案。
-
-### 场景 5：知识图谱关联发现——"这些事情之间有什么关系？"
-
-Qdrant 向量搜索能找到"相似的内容"，但 Graphiti 能发现"隐藏的关联"：
-
-> 你：最近哪些模块改动过？它们之间有关联吗？
-
-**只有 Qdrant**：列出最近的修改记录，但看不出模块间的依赖关系。
-
-**有 Graphiti**：
-
-> Claude：（hybrid_search 同时查询 Qdrant + Graphiti）最近改动了 3 个模块：
-> - `server_v3.py` 的 `hybrid_search` 函数
-> - `session-to-obsidian.py` 的 Qdrant 写入逻辑
-> - LaunchAgent 的环境变量配置
->
-> Graphiti 图谱显示它们有关联：`hybrid_search` 内部依赖 Graphiti MCP（HTTP 协议），而 LaunchAgent 负责启动 Graphiti 进程。上次 LaunchAgent 改了 Python 路径导致 Graphiti 没启动，hybrid_search 就全部超时了。这三个改动很可能是同一条链路上的问题。
-
-**差别**：从"列清单"变成"讲故事"，理解模块间的因果关系。
-
-### 场景 6：Obsidian 低成本召回——"那份设计文档里怎么写的？"
-
-Claude 之前帮你写了一份 5000 字的设计文档，存在 Obsidian 里：
-
-> 你：之前那个 AI 买手评分系统的设计方案，评分维度有哪些？
-
-**没有向量化**：通过 Obsidian MCP 读取原文，消耗 8000+ Token，还要等几秒加载。
-
-**有向量化（Obsidian 同步到 Qdrant）**：
-
-> Claude：（search_memory 命中 Obsidian 同步的向量，消耗 ~300 Token）评分维度包括：
-> 1. 品相评估分（成色、划痕、氧化程度）
-> 2. 价格合理性分（对比历史成交价）
-> 3. 市场热度分（品牌 × 款式 × 颜色的流通速度）
-> 4. 利润空间分（预估售价 - 进价 - 养护成本）
-
-**差别**：同样的信息，Token 消耗从 8000 降到 300，快了 10 倍以上。一天问 20 次，省下来的 Token 很可观。
-
-### 场景 7：长期趋势分析——"这几个月的规律是什么？"
-
-记忆积累到一定量后，可以做回顾性分析：
-
-> 你：总结一下我最近三个月用 Claude Code 主要做了什么
-
-> Claude：（search_memory + keyword_search 按日期范围搜索）
-> - **1 月**：主要在做中国象棋 React 项目，完成了棋盘渲染和基本走子规则
-> - **2 月**：转向二手奢侈品库存管理 App，用 Flutter + Supabase，完成了商品录入和拍照功能
-> - **3 月**：大量时间花在记忆系统搭建上——从 Pinecone 迁移到 Qdrant，集成 Graphiti，embedding 从小模型升级到 text-embedding-v4，解决了十几个连通性 Bug
-> - **贯穿三个月**：Obsidian 笔记体系逐步建立，会话自动归档流程从手动变成全自动
->
-> 技术偏好变化：从 JavaScript 转向 Python 后端 + Flutter 前端的组合。
-
-**差别**：你自己可能都忘了三个月前在做什么，但记忆系统帮你保留了完整的工作轨迹。
-
-### 场景 8：新项目冷启动——"帮我搭建一个新项目"
-
-> 你：帮我搭建一个 Next.js 项目
-
-**没有记忆**：Claude 给你一个标准模板。
-
-**有记忆**：
-
-> Claude：（搜到 preference 类记忆）根据你之前的偏好：
-> - 你习惯用 TypeScript strict 模式
-> - 状态管理偏好 Zustand 而不是 Redux
-> - 样式方案之前选了 Tailwind CSS
-> - 你讨厌默认的 ESLint 配置太松，上次手动加了 `@typescript-eslint/strict`
-> - 测试框架用 Vitest
->
-> 我直接按这些偏好初始化，行吗？
-
-**差别**：Claude 变成了了解你编程习惯的搭档，不需要每次重复说"我要 TypeScript"、"我用 Tailwind"。
 
 ---
 
