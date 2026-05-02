@@ -42,17 +42,35 @@ from qdrant_client.models import (
 # ── 配置 ──────────────────────────────────────────────
 QDRANT_URL = "http://localhost:6333"
 _TEST_MODE = "--test" in sys.argv
-COLLECTION_NAME = "unified_memories_v3_test" if _TEST_MODE else "unified_memories_v3"
-VECTOR_DIM = 1024
 
+# Embedding backend 切换:
+#   "dashscope" (默认): 阿里云 text-embedding-v4, 1024 维, collection=unified_memories_v3
+#   "local"          : 本地 MLX daemon (Qwen3-VL-Embedding-8B), 4096 维, collection=unified_memories_v3_local
+EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "dashscope").lower()
+
+if EMBED_BACKEND == "local":
+    VECTOR_DIM = 4096
+    _BASE_COLLECTION = "unified_memories_v3_local"
+elif EMBED_BACKEND == "dashscope":
+    VECTOR_DIM = 1024
+    _BASE_COLLECTION = "unified_memories_v3"
+else:
+    raise ValueError(f"未知的 EMBED_BACKEND: {EMBED_BACKEND}, 必须是 'dashscope' 或 'local'")
+
+COLLECTION_NAME = f"{_BASE_COLLECTION}_test" if _TEST_MODE else _BASE_COLLECTION
+
+import logging as _log
+_log.warning(f"[server_v3] EMBED_BACKEND={EMBED_BACKEND} | VECTOR_DIM={VECTOR_DIM} | COLLECTION={COLLECTION_NAME}")
 if _TEST_MODE:
-    import logging as _log
-    _log.warning(f"[server_v3] ⚠️  TEST MODE: 使用测试集合 {COLLECTION_NAME}")
+    _log.warning(f"[server_v3] ⚠️  TEST MODE")
 
-# 阿里云百炼 Embedding API
+# 阿里云百炼 Embedding API (backend=dashscope 时用)
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 EMBEDDING_MODEL = "text-embedding-v4"
 EMBEDDING_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
+
+# 本地 MLX Embedding Daemon (backend=local 时用)
+LOCAL_EMBED_URL = os.environ.get("LOCAL_EMBED_URL", "http://127.0.0.1:8765/embed")
 
 # importance 权重
 IMPORTANCE_WEIGHTS = {
@@ -91,43 +109,57 @@ _EMBED_MAX_RETRIES = 2
 _EMBED_BACKOFF_BASE = 1.0  # 首次重试等 1s，第二次等 2s
 
 
+def _get_embedding_dashscope(text: str, text_type: str) -> list[float]:
+    """调用阿里云 text-embedding-v4(1024 维)。"""
+    resp = _http_client.post(
+        EMBEDDING_API_URL,
+        headers={
+            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": EMBEDDING_MODEL,
+            "input": text,
+            "dimensions": VECTOR_DIM,
+            "encoding_format": "float",
+            "extra_body": {"text_type": text_type},
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+
+def _get_embedding_local(text: str, text_type: str) -> list[float]:
+    """调用本地 MLX daemon(Qwen3-VL-Embedding-8B, 4096 维)。"""
+    resp = _http_client.post(
+        LOCAL_EMBED_URL,
+        json={"text": text, "text_type": text_type},
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]
+
+
 def get_embedding(text: str, text_type: str = "document") -> list[float]:
-    """调用阿里云 text-embedding-v4 生成向量（带指数退避重试）。
+    """生成 embedding 向量(带指数退避重试)。按 EMBED_BACKEND 路由到本地或云端。
 
     Args:
         text: 输入文本
-        text_type: "query" 用于搜索查询，"document" 用于存储文档
+        text_type: "query" 用于搜索查询, "document" 用于存储文档
     Raises:
         RuntimeError: 重试耗尽后仍失败
     """
+    impl = _get_embedding_local if EMBED_BACKEND == "local" else _get_embedding_dashscope
     last_err: Exception | None = None
     for attempt in range(_EMBED_MAX_RETRIES + 1):
         try:
-            resp = _http_client.post(
-                EMBEDDING_API_URL,
-                headers={
-                    "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": EMBEDDING_MODEL,
-                    "input": text,
-                    "dimensions": VECTOR_DIM,
-                    "encoding_format": "float",
-                    "extra_body": {"text_type": text_type},
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["data"][0]["embedding"]
+            return impl(text, text_type)
         except Exception as e:
             last_err = e
             if attempt < _EMBED_MAX_RETRIES:
                 wait = _EMBED_BACKOFF_BASE * (2 ** attempt)
-                import logging as _log
-                _log.warning(f"[get_embedding] 第{attempt+1}次失败: {e}, {wait}s 后重试")
+                _log.warning(f"[get_embedding/{EMBED_BACKEND}] 第{attempt+1}次失败: {e}, {wait}s 后重试")
                 time.sleep(wait)
-    raise RuntimeError(f"Embedding API 重试{_EMBED_MAX_RETRIES}次后仍失败: {last_err}")
+    raise RuntimeError(f"Embedding({EMBED_BACKEND}) 重试 {_EMBED_MAX_RETRIES} 次后仍失败: {last_err}")
 
 
 # ── Qdrant 初始化 ────────────────────────────────────
@@ -328,6 +360,27 @@ def store_memory(content: str, category: str = "general", tags: str = "", source
             )
         ],
     )
+
+    # 双写 Graphiti (异步入队,失败不影响 Qdrant 已写入)
+    # 只对高价值类别(非 conversation/general/other)写入,避免图谱噪音
+    if category not in ("conversation", "general", "other"):
+        try:
+            preview = content[:80].replace("\n", " ")
+            name = f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] [{category}] {preview}"
+            call_graphiti_tool(
+                "add_memory",
+                {
+                    "name": name[:200],
+                    "episode_body": content[:4000],
+                    "group_id": "claude_code",
+                    "source": "text",
+                    "source_description": f"store_memory ({category})",
+                },
+                timeout=10,
+            )
+        except Exception as e:
+            _log.warning(f"[store_memory] Graphiti 双写失败(不影响 Qdrant): {e}")
+
     return f"记忆已存储 [ID: {memory_id[:8]}] 分类: {category} 重要性: {importance}"
 
 

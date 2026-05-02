@@ -741,6 +741,101 @@ cat neo4j-backup.json | docker exec -i neo4j-memory \
 
 ---
 
+## 🔒 完全本地化方案（无云端依赖,2026-05-02 新增）
+
+如果你想把 dashscope 全部替换成本地推理（**月费归零 + 完全离线 + 数据隐私**），系统现在支持双 backend 切换。
+
+### 核心改造
+
+| 组件 | 改造前 | 改造后 |
+|---|---|---|
+| **Embedding** | 阿里云 text-embedding-v4(1024 维) | 本地 MLX daemon (Qwen3-VL-Embedding-8B BF16, 4096 维) |
+| **Graphiti LLM** | 阿里云 qwen-plus | 本地 mlx_lm.server (Qwen3.6-35B-A3B BF16) |
+
+### 新增组件
+
+| 文件 | 用途 |
+|---|---|
+| `mcp-qdrant-memory/embed_daemon.py` | 本地 MLX embedding daemon (FastAPI + OpenAI 兼容 `/v1/embeddings`) |
+| `mcp-qdrant-memory/migrate_to_local.py` | 从 dashscope 1024 维 → 本地 4096 维迁移工具 |
+| `mcp-qdrant-memory/backfill_graphiti.py` | Qdrant 高价值记忆补图谱化脚本 |
+| `bin/macstudio-llm-tunnel.sh` | SSH 隧道脚本(开发机 → 算力机 LLM,LAN/Cloudflare 自动 fallback) |
+| `bin/start-mlx-lm-35b.sh` | mlx_lm.server 启动脚本 |
+| `launchagents/com.local.embed-daemon.plist` | embed daemon 自启 |
+| `launchagents/com.local.macstudio-llm-tunnel.plist` | SSH 隧道自启 |
+| `launchagents/com.local.mlx-lm-35b.plist` | mlx_lm.server 自启 |
+| `graphiti-local/patches/2026-05-02-additional-changes/` | Graphiti 适配本地 LLM 的额外补丁 |
+
+### 7 个脚本支持 EMBED_BACKEND 环境变量切换
+
+```bash
+# 默认本地 (推荐)
+EMBED_BACKEND=local      # → 调本地 daemon, 4096 维, collection=unified_memories_v3_local
+
+# 紧急回滚
+EMBED_BACKEND=dashscope  # → 调阿里云, 1024 维, collection=unified_memories_v3
+```
+
+支持切换的脚本：`server_v3.py` / `record_qa.py` / `compact_v3.py` / `migrate_to_v3.py` / `migrate_openclaw_v3.py` / `obsidian-sync-qdrant.py` / `session-to-obsidian.py`
+
+### 部署架构
+
+```
+开发机 (例: MacBook Pro 64GB)
+├── Docker
+│   ├── Qdrant   (6333)  ← 4096 维向量库
+│   └── Neo4j    (7687)  ← 知识图谱
+├── 本地服务 (LaunchAgent 自启)
+│   ├── embed_daemon         (8765)  ← Qwen3-VL-8B BF16, ~17GB 常驻
+│   ├── Graphiti MCP         (18001)
+│   └── SSH tunnel           (8082)  → 算力机 8081
+└── Hook + MCP 工具全部走本地
+
+算力机 (例: Mac Studio 256GB)
+└── mlx_lm.server (8081)  ← Qwen3.6-35B-A3B BF16, ~65GB 常驻
+    └── 给 Graphiti 做实体提取/关系提取/去重判断
+```
+
+### 性能对比
+
+| 指标 | dashscope 云端 | 本地方案 |
+|---|---|---|
+| Embedding 单次延迟 | 300-800 ms（含网络） | **~156 ms 稳态** |
+| 月费 | ~200 元 | **0 元** |
+| Graphiti add_memory 单 episode 处理 | qwen-plus ~30s | 35B-A3B ~60s |
+| 离线可用性 | 不可用 | **完全可用** |
+| 数据隐私 | 上传阿里云 | **完全本地** |
+
+### 重要避坑
+
+1. **维度切换需要重建 collection** — 1024 → 4096 维不能无缝迁移,要么清空老 Neo4j 数据,要么写迁移脚本
+2. **MLX 是 thread-local** — FastAPI 配 ThreadPoolExecutor(max_workers=1) 把推理 pin 到固定 worker
+3. **Reasoning model 不要用** — Qwen3.6-27B / DeepSeek-R1 类(chat_template 含 `<think>`)会先思考 600+ tokens 再答,慢 5-8 倍且字段不兼容
+4. **mlx_vlm 的 OpenAI Responses API 不完整** — 用 mlx_lm.server 更稳(自动 fallback 到 chat.completions)
+5. **Graphiti 补丁要重打** — 升级 graphiti-core 后 venv 内补丁会被覆盖,看 `graphiti-local/patches/2026-05-02-additional-changes/README.md`
+
+### 快速启用本地化(已有 dashscope 部署)
+
+```bash
+# 1. 起本地 embed daemon
+nohup python3 mcp-qdrant-memory/embed_daemon.py > /tmp/embed.log 2>&1 &
+
+# 2. 在另一台机器(如 Mac Studio)起 LLM
+nohup mlx_lm.server --model /path/to/Qwen3.6-35B-A3B-bf16 --port 8081 &
+
+# 3. 设环境变量切换 (可选,默认就是 local)
+export EMBED_BACKEND=local
+export OPENAI_BASE_URL=http://localhost:8082/v1   # SSH 隧道到算力机
+export OPENAI_API_KEY=local-no-auth
+
+# 4. 重启 Claude Code MCP
+# 5. 跑迁移脚本: python3 mcp-qdrant-memory/migrate_to_local.py
+```
+
+详细方案见 `bin/` `launchagents/` `graphiti-local/patches/2026-05-02-additional-changes/`。
+
+---
+
 ## License
 
 MIT

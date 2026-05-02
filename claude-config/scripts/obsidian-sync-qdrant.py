@@ -31,10 +31,21 @@ from pathlib import Path
 OBSIDIAN_API_URL = "https://localhost:27124"
 OBSIDIAN_API_KEY = os.environ.get("OBSIDIAN_API_KEY", "")
 
+# Embedding backend 切换:
+#   local (默认): 本地 MLX daemon, 4096 维, collection=unified_memories_v3_local
+#   dashscope   : 阿里云 v4, 1024 维, collection=unified_memories_v3
+EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "local").lower()
+
 # Qdrant V3
 QDRANT_URL = "http://localhost:6333"
-COLLECTION_NAME = "unified_memories_v3"
-VECTOR_DIM = 1024
+if EMBED_BACKEND == "local":
+    COLLECTION_NAME = "unified_memories_v3_local"
+    VECTOR_DIM = 4096
+elif EMBED_BACKEND == "dashscope":
+    COLLECTION_NAME = "unified_memories_v3"
+    VECTOR_DIM = 1024
+else:
+    raise ValueError(f"未知 EMBED_BACKEND: {EMBED_BACKEND}")
 
 # Graphiti
 GRAPHITI_URL = "http://localhost:18001/mcp"
@@ -42,6 +53,7 @@ GRAPHITI_URL = "http://localhost:18001/mcp"
 # Embedding
 EMBEDDING_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+LOCAL_EMBED_URL = os.environ.get("LOCAL_EMBED_URL", "http://127.0.0.1:8765/embed")
 
 # 本地
 LOCAL_DATA_DIR = Path.home() / ".claude" / "scripts" / "hooks" / ".obsidian-session-data"
@@ -219,7 +231,28 @@ def obsidian_get_file(path: str) -> str | None:
 
 # ===== Embedding & Qdrant =====
 
-def get_embeddings_batch(texts: list[str]) -> list[list[float]] | None:
+def _get_embeddings_local(texts: list[str]) -> list[list[float]] | None:
+    """本地 MLX daemon 单条调用,循环处理。"""
+    all_embeddings: list[list[float]] = []
+    for text in texts:
+        payload = json.dumps({"text": text, "text_type": "document"}).encode("utf-8")
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                _, body, _ = http_request(
+                    LOCAL_EMBED_URL, payload,
+                    {"Content-Type": "application/json"}, "POST", 60)
+                all_embeddings.append(json.loads(body)["embedding"])
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+                else:
+                    print(f"  ⚠️ 本地 daemon embedding 失败: {e}", file=sys.stderr)
+                    return None
+    return all_embeddings
+
+
+def _get_embeddings_dashscope(texts: list[str]) -> list[list[float]] | None:
     if not DASHSCOPE_API_KEY:
         return None
     all_embeddings: list[list[float]] = []
@@ -250,6 +283,12 @@ def get_embeddings_batch(texts: list[str]) -> list[list[float]] | None:
                     print(f"  ⚠️ Embedding API 失败: {e}", file=sys.stderr)
                     return None
     return all_embeddings
+
+
+def get_embeddings_batch(texts: list[str]) -> list[list[float]] | None:
+    if EMBED_BACKEND == "local":
+        return _get_embeddings_local(texts)
+    return _get_embeddings_dashscope(texts)
 
 
 def make_obsidian_point_id(path: str, chunk_index: int) -> str:
